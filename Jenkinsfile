@@ -57,12 +57,13 @@ pipeline {
 
                     docker run -d \
                         --name interview-app-test \
+                        --add-host=host.docker.internal:host-gateway \
                         -p 5000:5000 \
                         interview-app:${BUILD_NUMBER}
 
                     sleep 5
 
-                    curl --fail http://localhost:5000/health
+                    curl --fail http://host.docker.internal:5000/health
                 '''
             }
         }
