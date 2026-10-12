@@ -2,17 +2,26 @@ pipeline {
     agent any
 
     options {
+        skipDefaultCheckout(true)
         timeout(time: 10, unit: 'MINUTES')
     }
 
+    triggers {
+        pollSCM('H/2 * * * *')
+    }
+
     stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
 
         stage('Install Dependencies') {
             steps {
                 sh '''
                     python3 -m venv .venv
                     . .venv/bin/activate
-                    pip install --upgrade pip
                     pip install -r app/requirements.txt
                 '''
             }
@@ -42,11 +51,9 @@ pipeline {
             }
         }
 
-        stage('Docker Build') {
+        stage('Build') {
             steps {
-                sh '''
-                    docker build -t interview-app:${BUILD_NUMBER} .
-                '''
+                sh 'docker build -t interview-app:${BUILD_NUMBER} .'
             }
         }
 
@@ -62,7 +69,6 @@ pipeline {
                         interview-app:${BUILD_NUMBER}
 
                     sleep 5
-
                     curl --fail http://host.docker.internal:5000/health
                 '''
             }
@@ -72,47 +78,56 @@ pipeline {
     post {
         always {
             script {
-                def buildStatus = currentBuild.currentResult ?: 'UNKNOWN'
-                def durationSeconds = (currentBuild.duration ?: 0) / 1000.0
+                def successful =
+                    currentBuild.currentResult == 'SUCCESS' ? 1 : 0
+                def durationSeconds =
+                    (currentBuild.duration ?: 0) / 1000.0
 
                 withEnv([
-                    "CI_BUILD_STATUS=${buildStatus}",
-                    "CI_BUILD_DURATION=${durationSeconds}"
+                    "PIPELINE_BUILD_STATUS=${successful}",
+                    "PIPELINE_BUILD_DURATION=${durationSeconds}"
                 ]) {
-                    sh '''
-                        total=0
-                        passed=0
-                        failed=0
-                        skipped=0
-                        errors=0
+                    try {
+                        sh '''
+                            python3 - <<'PY'
+import os
+import xml.etree.ElementTree as ET
 
-                        if [ -f reports/junit.xml ]; then
-                            total=$(python3 -c 'import xml.etree.ElementTree as ET; r=ET.parse("reports/junit.xml").getroot(); s=[r] if r.tag=="testsuite" else r.findall(".//testsuite"); print(sum(int(x.attrib.get("tests",0)) for x in s))')
-                            failed=$(python3 -c 'import xml.etree.ElementTree as ET; r=ET.parse("reports/junit.xml").getroot(); s=[r] if r.tag=="testsuite" else r.findall(".//testsuite"); print(sum(int(x.attrib.get("failures",0)) for x in s))')
-                            skipped=$(python3 -c 'import xml.etree.ElementTree as ET; r=ET.parse("reports/junit.xml").getroot(); s=[r] if r.tag=="testsuite" else r.findall(".//testsuite"); print(sum(int(x.attrib.get("skipped",0)) for x in s))')
-                            errors=$(python3 -c 'import xml.etree.ElementTree as ET; r=ET.parse("reports/junit.xml").getroot(); s=[r] if r.tag=="testsuite" else r.findall(".//testsuite"); print(sum(int(x.attrib.get("errors",0)) for x in s))')
-                            passed=$((total - failed - skipped - errors))
-                        fi
+passed = 0
+failed = 0
+report = "reports/junit.xml"
 
-                        cat > ci-metrics.txt <<EOF
-ci_build_status{status="${CI_BUILD_STATUS}"} 1
-ci_build_duration_seconds ${CI_BUILD_DURATION}
-ci_tests_total ${total}
-ci_tests_passed ${passed}
-ci_tests_failed ${failed}
-ci_tests_skipped ${skipped}
-EOF
+if os.path.exists(report):
+    root = ET.parse(report).getroot()
 
-                        curl --fail \
-                            --data-binary @ci-metrics.txt \
-                            http://pushgateway:9091/metrics/job/devops_interview/build/${BUILD_NUMBER}
-                    '''
+    for case in root.iter("testcase"):
+        if case.find("failure") is not None or case.find("error") is not None:
+            failed += 1
+        elif case.find("skipped") is None:
+            passed += 1
+
+with open("ci-metrics.txt", "w") as metrics:
+    metrics.write(
+        f"pipeline_build_status {os.environ['PIPELINE_BUILD_STATUS']}\\n"
+    )
+    metrics.write(
+        f"pipeline_build_duration_seconds "
+        f"{os.environ['PIPELINE_BUILD_DURATION']}\\n"
+    )
+    metrics.write(f"pipeline_tests_passed {passed}\\n")
+    metrics.write(f"pipeline_tests_failed {failed}\\n")
+PY
+
+                            curl --fail --silent --show-error \
+                                --data-binary @ci-metrics.txt \
+                                http://pushgateway:9091/metrics/job/interview_pipeline
+                        '''
+                    } finally {
+                        sh 'docker rm -f interview-app-test || true'
+                        deleteDir()
+                    }
                 }
             }
-
-            sh '''
-                docker rm -f interview-app-test || true
-            '''
         }
     }
 }
